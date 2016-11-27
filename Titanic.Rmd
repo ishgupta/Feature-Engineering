@@ -1,0 +1,296 @@
+---
+title: "Feature Engineering with Titanic Dataset"
+output: html_notebook
+---
+
+This script tries to enlighten the knowledge about Feature Engineering with the most common Titanic Data set.
+
+REFERENCE: http://amunategui.github.io/variable-importance-shuffler/
+
+### import libraries
+```{r, message=FALSE}
+library(dplyr)
+library(Amelia)
+library(caret)
+library(gbm)
+```
+
+
+### read the data from UCI ML Repo
+```{r}
+titanicDF <- read.csv('http://math.ucdenver.edu/RTutorial/titanic.txt',sep='\t')
+
+glimpse(titanicDF)
+summary(titanicDF)
+
+listOfVars = list("titanicDF")
+```
+
+###let's create a new feature called Title so as to segregate Adults (with Mr, Miss or Mrs in their Name)
+```{r}
+titanicDF$Title <- ''
+titanicDF$Title[grep('Mrs|Lady|Madame', titanicDF$Name)] <- 'Mrs'
+titanicDF$Title[grep('Mr[^s]| Sir', titanicDF$Name)] <- 'Mr'
+titanicDF$Title[grep('Miss | Ms', titanicDF$Name)] <- 'Miss'
+titanicDF$Title[grep('Dr ', titanicDF$Name)] <- 'Doctor'
+titanicDF$Title[grep('Master |child', titanicDF$Name)] <- 'Child'
+titanicDF$Title[grep('Colonel|Captain|Col | Rev| Major', titanicDF$Name)] <- 'Defence'
+titanicDF$Title[titanicDF$Title==""] <- 'Nothing'
+
+unique(titanicDF$Title)
+
+#the condensed way:
+titanicDF$Title <- ifelse(grepl('Mr[^s]| Sir', titanicDF$Name), 'Mr', 
+                          ifelse(grepl('Mrs|Lady|Madame', titanicDF$Name), 'Mrs', 
+                                 ifelse(grepl('Miss | Ms', titanicDF$Name), 'Miss', 
+                                        ifelse(grepl('Dr ', titanicDF$Name), 'Doctor', 
+                                               ifelse(grepl('Master |child', titanicDF$Name), 'Child', 
+                                                      ifelse(grepl('Colonel|Captain|Col | Rev| Major', titanicDF$Name), 'Defence', 
+                                                             'Nothing'))))))
+
+```
+
+###Check for missing values
+```{r}
+missmap(titanicDF, col = c("orange", "green"))
+
+#Since, Age has missing values
+table(titanicDF$Title[is.na(titanicDF$Age)])
+
+#Treat the Age variable to removed missing values. 
+# Here, we go by differentiating the Age values on different groups of people, and using the median of each group in place of the missing value.
+titanicDF$Age <- ifelse(titanicDF$Title=="Mr" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Mr"], na.rm = TRUE), 
+       ifelse(titanicDF$Title=="Mrs" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Mrs"], na.rm = TRUE), 
+              ifelse(titanicDF$Title == "Doctor" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title == "Doctor"], na.rm = TRUE), 
+                     ifelse(titanicDF$Title=="Defence" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Defence"], na.rm = TRUE), 
+                            ifelse(titanicDF$Title=="Miss" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Miss"], na.rm = TRUE), 
+                                   ifelse(titanicDF$Title=="Child" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Child"], na.rm = TRUE), 
+                                          ifelse(titanicDF$Title=="Nothing" & is.na(titanicDF$Age), median(titanicDF$Age[titanicDF$Title=="Nothing"], na.rm = TRUE), 
+                                                 titanicDF$Age)))))))
+
+ggplot(aes(y=Survived, x=Age), data=titanicDF) + geom_point(alpha=0.2)
+```
+Age and Survival does not seem to be related.
+
+
+#### Re-order the variables, so as to bring the result 'Survived' in last, and remove the Name variable from data since it won't have any significance now, for the reason we have distinguished Passengers on their Title.
+```{r}
+titanicDF <- titanicDF[c(setdiff(names(titanicDF), c("Survived", "Name")), "Survived")]
+
+glimpse(titanicDF)
+
+```
+
+### Is Survival related to Passenger Class?
+```{r}
+prop.table(table(titanicDF[, c("PClass", "Survived")]))*100
+
+ggplot(aes(sum(Survived), col=PClass), data= titanicDF) + geom_histogram()
+ggplot(aes(y = Survived, x = PClass), data=titanicDF) + geom_jitter(alpha = 0.5)
+
+```
+The majority of those who could not Survive, seem to be from Class 3, and the most of ones who Survived from Class 1. So, Class was an important conrtributor to a person being saved.
+
+### To start with finding out the exact correlation and model the data, we need to first create Dummy variables for the Factor columns.
+##### this makes use of the 'caret' library- dummyVars function used with the formula " ~ ." creates dummies for all the Characters and Factor variables, doesn't make any modifications to the numerical variables.
+
+Using dummyVars with fullRank = T will assure to create (v - 1) variables for v values of a variable, but we try it out without the FullRank.
+```{r}
+titanicDummy <- dummyVars("~.",data=titanicDF, fullRank=F)
+
+titanicDummy_pred <- as.data.frame(predict(titanicDummy,titanicDF))
+
+listOfVars <- append(listOfVars, c("titanicDummy", "titanicDummy_pred"))
+```
+
+
+### Split the data into Training and Test.
+```{r}
+splitIndex <- sample(nrow(titanicDF), floor(0.5 * nrow(titanicDF)))
+
+trainDF <- titanicDummy_pred[splitIndex, ]
+testDF <- titanicDummy_pred[-splitIndex, ]
+
+listOfVars <- append(listOfVars, c("trainDF", "testDF"))
+```
+
+
+### Transform the response variable, 'Survived' into text for Classification
+```{r}
+outcomeName <- 'Survived'
+predictorNames <- setdiff(names(titanicDummy_pred), outcomeName)
+
+# transform outcome variable to text as it is required for caret in classification
+trainDF[, outcomeName] <- ifelse(trainDF[, outcomeName]==1, "Yes", "No")
+
+listOfVars <- append(listOfVars, c("outcomeName", "predictorNames"))
+```
+
+
+### Prepare a simple GBM model
+```{r}
+set.seed(1234)
+
+objControl <- trainControl(method='cv', number=2, returnResamp='none', summaryFunction = twoClassSummary, classProbs = TRUE)
+ 
+objGBM <- train(trainDF[,predictorNames], as.factor(trainDF[,outcomeName]), method='gbm', trControl = objControl, metric = "ROC", tuneGrid = expand.grid(n.trees = 5, interaction.depth = 3, shrinkage = 0.1, n.minobsinnode = c(10))
+)
+
+predictions <- predict(object = objGBM, testDF[, predictorNames], type= 'prob')
+
+listOfVars <- append(listOfVars, c("objControl", "objGBM","predictions"))
+```
+
+
+#### AUC approximation using GBM predictions utilizing ROCR:
+
+```{r, message= FALSE}
+library(ROCR)
+```
+
+
+```{r}
+calcAUC_rocr <- function(predictedValues, trueValues){
+  ROCR_pred <- prediction(predictedValues, trueValues)
+  ROCR_auc <- performance(ROCR_pred, "auc")
+  ROCR_auc@y.values
+}
+
+listOfVars = append(listOfVars, "calcAUC_rocr")
+```
+
+```{r}
+GetROC_AUC = function(probs, true_Y){
+        # AUC approximation
+        # http://stackoverflow.com/questions/4903092/calculate-auc-in-r
+        # ty AGS
+        probsSort = sort(probs, decreasing = TRUE, index.return = TRUE)
+        val = unlist(probsSort$x)
+        idx = unlist(probsSort$ix) 
+        
+        roc_y = true_Y[idx];
+        stack_x = cumsum(roc_y == 0)/sum(roc_y == 0)
+        stack_y = cumsum(roc_y == 1)/sum(roc_y == 1)   
+        
+        auc = sum((stack_x[2:length(roc_y)]-stack_x[1:length(roc_y)-1])*stack_y[2:length(roc_y)])
+        return(auc)
+}
+```
+
+```{r}
+auc <- GetROC_AUC(predictions[[2]], testDF[, outcomeName])
+print(paste('AUC:', auc))
+
+#auc_rocr <- calcAUC_rocr(predictions[[2]], testDF[, outcomeName])
+
+#auc - auc_rocr[[1]]
+
+listOfVars = append(listOfVars, "auc")
+```
+
+#### ROCR plot can also be referred for choosing a threshold value to be used while using the probability predictions returned by the Model.
+```{r}
+plot(performance(ROCR_pred, "tpr", "fpr"), colorize = TRUE, print.cutoffs.at = seq(0, 1, 0.1), text.adj = c(-0.2, 1.7))
+
+```
+
+
+#### Shuffing with GBM. Here, all the observations per Predictor will be shuffled to find the variations in predictions, if any, on the shuffled dataset.
+
+As we shuffle, we will have the mean AUC computed on shuffling every predictor variable, which we will see also helps to find the important variables. Since, the variables which are correlated with the Response will not deviate for their score.
+
+#####Issue 1: If I replace the function, GetROC_AUC with the calcAUC_rocr, the result for feature importance calculated is completely different. The method, "calcAUC_rocr" uses the methods provided by ROCR package to calculate the AUC, whereas GetROC_AUC() has a logic referred from a Blog. Am I missing something?"
+
+```{r}
+AUCShuffle <- NULL
+shuffletimes <- 500
+featuresMeanAUCs <- c()
+
+for (feature in predictorNames) {
+        featureAUCs <- c()
+        shuffledData <- testDF[, predictorNames]
+        for (iter in 1:shuffletimes) {
+              shuffledData[, feature] <- sample(shuffledData[, feature], length(shuffledData[, feature]))
+                predictions <- predict(object=objGBM, shuffledData[, predictorNames], type='prob')
+               featureAUCs <- c(featureAUCs, GetROC_AUC(predictions[[2]], testDF[, outcomeName]))
+        }
+        featuresMeanAUCs <- c(featuresMeanAUCs, mean(featureAUCs < refAUC))
+}
+
+AUCShuffle <- data.frame('feature'=predictorNames, 'importance'=featuresMeanAUCs)
+AUCShuffle <- AUCShuffle[order(AUCShuffle$importance, decreasing=TRUE),]
+print(AUCShuffle)
+
+listOfVars = append(listOfVars, c("AUCShuffle", "shuffletimes", "featuresMeanAUCs"))
+```
+
+
+### Shuffling with the GLM by using the RMSE score instead of the AUC.
+####Issue 2: 
+When I try to train this GLM model, I get the below error message,
+
+"You are trying to do regression and your outcome only has two possible values Are you trying to do classification? If so, use a 2 level factor as your outcome column.prediction from a rank-deficient fit may be misleading"
+
+```{r}
+# change a few things for a linear model
+objControl <- trainControl(method='cv', number=2)
+trainDF[,outcomeName] <- ifelse(trainDF[,outcomeName]=='Yes', 1, 0)
+ 
+# shuffling with GLM
+objGLM <- train(trainDF[,predictorNames],  trainDF[,outcomeName],
+                method='glm',
+                trControl=objControl,
+                preProc = c("center", "scale"))
+
+predictions <- predict(object=objGLM, testDF[,predictorNames])
+refRMSE=sqrt((sum((testDF[,outcomeName]-predictions[[2]])^2))/nrow(testDF))
+print(paste('Reference RMSE:',refRMSE))
+
+```
+
+
+
+### using mRMRe
+```{r, message=FALSE}
+library(mRMRe)
+```
+
+```{r}
+tmpAge <- titanicDF$Age
+titanicDF$Age <- as.integer(titanicDF$Age)
+
+titanicDF <- with(titanicDF, titanicDF[order(PClass, Sex, Title),])
+
+
+ind <- sapply(titanicDF, is.integer)
+titanicDF[ind] <- lapply(titanicDF[ind], as.numeric)
+
+tmp <- titanicDF
+tmp <- tmp[, -4]
+
+dd <- mRMR.data(data = tmp)
+
+feats <- mRMR.classic(data = dd, target_indices = c(ncol(titanicDF)), feature_count = 10)
+
+variableImportance <-data.frame('importance'=feats@mi_matrix[nrow(feats@mi_matrix),])
+variableImportance$feature <- rownames(variableImportance)
+row.names(variableImportance) <- NULL
+variableImportance <- na.omit(variableImportance)
+variableImportance <- variableImportance[order(variableImportance$importance, decreasing=TRUE),]
+print(variableImportance)
+```
+```{r}
+model <- train(Survived ~ ., data = trainDF, method='rf', trControl = trainControl(method="cv", number=5))
+
+model
+
+testDF$Survived_pred <- predict(model, newdata = testDF)
+
+table(testDF$Survived, testDF$Survived_pred)
+```
+
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
